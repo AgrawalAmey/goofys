@@ -1,20 +1,10 @@
 #!/bin/bash
 
-: ${TRAVIS:="false"}
-: ${FAST:="false"}
+: ${iter:=1}
 : ${test:=""}
+: ${FAST:="false"}
 : ${CACHE:="false"}
-
-iter=10
-
-if [ "$TRAVIS" != "false" ]; then
-    set -o xtrace
-    iter=1
-fi
-
-if [ "$FAST" != "false" ]; then
-    iter=1
-fi
+: ${howmany:=100}
 
 set -o errexit
 set -o nounset
@@ -26,6 +16,7 @@ fi
 
 cmd=$1
 mnt=$2
+
 if [ $# -gt 2 ]; then
     t=$3
 else
@@ -36,29 +27,13 @@ prefix=$mnt/test_dir
 
 MOUNTED=0
 
-if [[ "$cmd" == riofs* ]]; then
-    RIOFS="true"
-else
-    RIOFS="false"
-fi
-
-if [[ "$cmd" == blobfuse* ]]; then
-    BLOBFUSE="true"
-else
-    BLOBFUSE="false"
-fi
-
 $cmd >& mount.log &
 PID=$!
 
 function cleanup {
     if [ $MOUNTED == 1 ]; then
-        popd >/dev/null
-        if [ "$TRAVIS" != "false" ]; then
-            rmdir $prefix
-        else
-            rmdir $prefix >& /dev/null || true # riofs doesn't support rmdir
-        fi
+        popd >/dev/null    
+        rmdir $prefix >& /dev/null || true
     fi
 
     if [ "$PID" != "" ]; then
@@ -101,13 +76,10 @@ function wait_for_mount {
     fi
 }
 
-if [ "$TRAVIS" == "false" -a "$cmd" != "cat" ]; then
-    wait_for_mount
-    MOUNTED=1
-else
-    # in travis we mount things externally so we know we are mounted
-    MOUNTED=1
-fi
+
+wait_for_mount
+MOUNTED=1
+
 
 mkdir -p "$prefix"
 pushd "$prefix" >/dev/null
@@ -117,35 +89,16 @@ if [ $(id -u) != 0 ]; then
     SUDO=sudo
 fi
 
-function drop_cache {
-    if [ "$TRAVIS" == "false" ]; then
-        (echo 3 | $SUDO tee /proc/sys/vm/drop_caches) > /dev/null
-    fi
-}
-
 export TIMEFORMAT=%R
 
 function run_test {
     test=$1
     shift
-    drop_cache
     sleep 2
     if [ "$CACHE" == "false" ]; then
         if [ -d /tmp/cache ]; then
             rm -Rf /tmp/cache/*
         fi
-	if [ "$BLOBFUSE" == "true" ]; then
-	    popd >/dev/null
-	    # re-mount blobfuse to cleanup cache
-	    if [ "$PID" != "" ]; then
-		fusermount -u $mnt
-		sleep 1
-	    fi
-	    $cmd >& mount.log &
-	    PID=$!
-	    wait_for_mount
-	    pushd "$prefix" >/dev/null
-	fi
     fi
 
     echo -n "$test "
@@ -156,33 +109,16 @@ function run_test {
     fi
 }
 
-function get_howmany {
-    if [ "$TRAVIS" != "false" ]; then
-	if [ $# == 2 ]; then
-	    howmany=$2
-	else
-            howmany=10
-	fi
-    else
-        if [ $# == 0 ]; then
-            howmany=100
-        else
-            howmany=$1
-        fi
-    fi
-}
-
 function create_files {
-    get_howmany $@
-
+    echo " $howmany "
     for i in $(seq 1 $howmany); do
         echo $i > file$i
     done
 }
 
 function ls_files {
-    get_howmany $@
     # people usually use ls in the terminal when color is on
+    echo " $howmany "
     numfiles=$(ls -1 --color=always | wc -l)
     if [ "$numfiles" != "$howmany" ]; then
         echo "$numfiles != $howmany"
@@ -191,8 +127,7 @@ function ls_files {
 }
 
 function rm_files {
-    get_howmany $@
-
+    echo " $howmany "
     for i in $(seq 1 $howmany); do
         rm file$i >&/dev/null || true
     done
@@ -229,8 +164,7 @@ function rm_tree {
 }
 
 function create_files_parallel {
-    get_howmany $@
-
+    echo " $howmany "
     (for i in $(seq 1 $howmany); do
         echo $i > file$i & true
     done
@@ -238,8 +172,7 @@ function create_files_parallel {
 }
 
 function rm_files_parallel {
-    get_howmany $@
-
+    echo " $howmany "
     (for i in $(seq 1 $howmany); do
         rm file$i & true
     done
@@ -262,6 +195,30 @@ function read_first_byte {
     dd if=largefile of=/dev/null bs=1 count=1 iflag=nocache status=none
 }
 
+function write_md5 {
+    seed=$(dd if=/dev/urandom bs=128 count=1 status=none | base64 -w 0)
+    random_cmd="openssl enc -aes-256-ctr -pbkdf2 -pass pass:$seed -nosalt"
+    count=1000
+    if [ "$FAST" == "true" ]; then
+        count=100
+    fi
+    MD5=$(dd if=/dev/zero bs=1MB count=$count status=none | $random_cmd | \
+        tee >(md5sum) >(dd of=largefile bs=1MB oflag=nocache status=none) >/dev/null | cut -f 1 '-d ')
+}
+
+function read_md5 {
+    READ_MD5=$(md5sum largefile | cut -f 1 '-d ')
+    if [ "$READ_MD5" != "$MD5" ]; then
+        echo "$READ_MD5 != $MD5" >&2
+        rm largefile
+        exit 1
+    fi
+}
+
+function rm {
+    /bin/rm $@
+}
+
 if [ "$t" = "" -o "$t" = "create" ]; then
     for i in $(seq 1 $iter); do
         run_test create_files
@@ -275,39 +232,6 @@ if [ "$t" = "" -o "$t" = "create_parallel" ]; then
         run_test rm_files_parallel
     done
 fi
-
-function write_md5 {
-    seed=$(dd if=/dev/urandom bs=128 count=1 status=none | base64 -w 0)
-    random_cmd="openssl enc -aes-256-ctr -pbkdf2 -pass pass:$seed -nosalt"
-    count=1000
-    if [ "$FAST" == "true" ]; then
-        count=100
-    fi
-    MD5=$(dd if=/dev/zero bs=1MB count=$count status=none | $random_cmd | \
-        tee >(md5sum) >(dd of=largefile bs=1MB oflag=nocache status=none) >/dev/null | cut -f 1 '-d ')
-    if [ "$RIOFS" == "true" ]; then
-        # riofs doesn't wait for flush, so we need to wait for object to show up
-        # XXX kind of broken due to eventual consistency but it's hte best we can do
-        while ! aws s3api --endpoint ${ENDPOINT} head-object --bucket ${BUCKET} --key test_dir/largefile >& /dev/null; do sleep 0.1; done
-    fi
-}
-
-function read_md5 {
-    READ_MD5=$(md5sum largefile | cut -f 1 '-d ')
-    if [ "$READ_MD5" != "$MD5" ]; then
-        echo "$READ_MD5 != $MD5" >&2
-        rm largefile
-        exit 1
-    fi
-}
-
-function rm {
-    if [ "$RIOFS" == "true" ]; then
-        while ! /bin/rm $@; do true; done
-    else
-        /bin/rm $@
-    fi
-}
 
 if [ "$t" = "" -o "$t" = "io" ]; then
     for i in $(seq 1 $iter); do
@@ -330,25 +254,25 @@ if [ "$t" = "" -o "$t" = "io" ]; then
 fi
 
 if [ "$t" = "" -o "$t" = "ls" ]; then
-    create_files_parallel 2000 2000
+    create_files_parallel
     for i in $(seq 1 $iter); do
-        run_test ls_files 2000 2000
+        run_test ls_files
     done
-    rm_files 2000 2000
+    rm_files
 fi
 
 if [ "$t" = "ls_create" ]; then
-    create_files_parallel 1000
+    create_files_parallel
     test=dummy
     sleep 10
 fi
 
 if [ "$t" = "ls_ls" ]; then
-    run_test ls_files 1000 1000
+    run_test ls_files
 fi
 
 if [ "$t" = "ls_rm" ]; then
-    rm_files 1000
+    rm_files
     test=dummy
 fi
 
